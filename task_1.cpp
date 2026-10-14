@@ -1,44 +1,81 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
-#include <string.h>
+#include <sys/wait.h>
+#include <sys/time.h>
+#include <signal.h>
 
-int main(void)
+const char *getSignalName(int signalNumber)
 {
-    int fd[2];
-    char buffer[100];
+    switch (signalNumber) {
 
-    pipe(fd);
+        case SIGKILL:
+            return "SIGKILL";
+
+        case SIGPIPE:
+            return "SIGPIPE";
+
+        case SIGTERM:
+            return "SIGTERM";
+
+        default:
+            return "UNKNOWN";
+    }
+}
+
+int main(int argc, char *argv[])
+{
+    if (argc < 2) {
+        printf("Usage: %s command \n", argv[0]);
+        return 1;
+    }
+
+    struct timeval t1, t2;
+
+    gettimeofday(&t1, NULL);
 
     pid_t pid = fork();
 
+    if (pid == -1) {
+        perror("fork");
+        return 1;
+    }
+
     if (pid == 0) {
-        close(fd[0]);
+        execvp(argv[1], &argv[1]);
 
-        char message[] = "hello";
+        perror("execvp");
+        _exit(127);
+    }
 
-        write(fd[1], message, strlen(message));
+    int status;
 
-        close(fd[1]);
-    } else {
-        close(fd[1]);
+    waitpid(pid, &status, 0);
 
-        int bytesRead = read(fd[0], buffer, sizeof(buffer) - 1);
+    gettimeofday(&t2, NULL);
 
-        if (bytesRead < 0) {
-            perror("read");
-            return 1;
-        }
+    double time =
+        (t2.tv_sec - t1.tv_sec) +
+        (t2.tv_usec - t1.tv_usec) / 1000000.0;
 
-        if (bytesRead == 0) {
-            printf("Pipe is empty\n");
-            return 0;
-        }
+    printf("time: %.3lf s\n", time);
 
-        buffer[bytesRead] = '\0';
+    if (WIFEXITED(status)) {
+        int exitCode = WEXITSTATUS(status);
 
-        printf("Parent read: %s\n", buffer);
+        printf("exited normally\n");
+        printf("exit code: %d\n", exitCode);
 
-        close(fd[0]);
+        return exitCode;
+    }
+
+    if (WIFSIGNALED(status)) {
+        int signalNumber = WTERMSIG(status);
+
+        printf("terminated by signal: %s\n", getSignalName(signalNumber));
+        printf("signal number: %d\n", signalNumber);
+
+        return signalNumber;
     }
 
     return 0;
