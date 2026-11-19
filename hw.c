@@ -1,136 +1,127 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/wait.h>
-#include <sys/mman.h>
-#include <semaphore.h>
+#include <unistd.h>
 
-#define N 4
-#define BLOCK_SIZE 4096
+int fd;
+pid_t writer_pid;
 
-typedef struct {
-    char buffer[N][BLOCK_SIZE];
-    int size[N];
+unsigned char input_byte;
+int bit_pos = -1;
 
-    int write_pos;
-    int read_pos;
+unsigned char output_byte = 0;
+int bit_count = 0;
 
-    sem_t full;
-    sem_t empty;
-    sem_t mutex;
-} SharedData;
+void send_next_bit(void) {
+    if (bit_pos < 0) {
+        ssize_t n = read(fd, &input_byte, 1);
 
+        if (n < 0) {
+            kill(writer_pid, SIGTERM);
+            wait(NULL);
+            close(fd);
+            _exit(1);
+        }
 
-void producer(int fd, SharedData *data)
-{
-    while (1) {
-        sem_wait(&data->full);
-        sem_wait(&data->mutex);
+        if (n == 0) {
+            kill(writer_pid, SIGTERM);
+            wait(NULL);
+            close(fd);
+            _exit(0);
+        }
 
-        int pos = data->write_pos;
+        bit_pos = 7;
+    }
 
-        int n = read(fd, data->buffer[pos], BLOCK_SIZE);
-        data->size[pos] = n;
+    int bit = (input_byte >> bit_pos) & 1;
+    bit_pos--;
 
-        data->write_pos = (data->write_pos + 1) % N;
-
-        sem_post(&data->mutex);
-        sem_post(&data->empty);
-
-        if (n == 0)
-            break;
+    if (bit == 0) {
+        kill(writer_pid, SIGUSR1);
+    } else {
+        kill(writer_pid, SIGUSR2);
     }
 }
 
-
-void consumer(int fd, SharedData *data)
-{
-    while (1) {
-        sem_wait(&data->empty);
-        sem_wait(&data->mutex);
-
-        int pos = data->read_pos;
-        int n = data->size[pos];
-
-        if (n > 0)
-            write(fd, data->buffer[pos], n);
-
-        data->read_pos = (data->read_pos + 1) % N;
-
-        sem_post(&data->mutex);
-        sem_post(&data->full);
-
-        if (n == 0)
-            break;
-    }
+void ready_for_next_bit(int signo) {
 }
 
+void receive_bit_handler(int signo) {
+    int bit;
 
-int main(int argc, char *argv[])
-{
-    if (argc != 3) {
-        printf("Usage: %s source destination\n", argv[0]);
+    if (signo == SIGUSR1) {
+        bit = 0;
+    } else {
+        bit = 1;
+    }
+
+    output_byte = (output_byte << 1) | bit;
+    bit_count++;
+
+    if (bit_count == 8) {
+        write(STDOUT_FILENO, &output_byte, 1);
+
+        output_byte = 0;
+        bit_count = 0;
+    }
+
+    kill(getppid(), SIGUSR1);
+}
+
+int main(int argc, char *argv[]) {
+    if (argc != 2) {
         return 1;
     }
 
-    int src = open(argv[1], O_RDONLY);
+    fd = open(argv[1], O_RDONLY);
 
-    if (src == -1) {
-        perror("open source");
+    if (fd == -1) {
         return 1;
     }
 
-    int dst = open(argv[2], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    signal(SIGUSR1, receive_bit_handler);
+    signal(SIGUSR2, receive_bit_handler);
 
-    if (dst == -1) {
-        perror("open destination");
-        return 1;
-    }
+    sigset_t block_mask;
+    sigset_t old_mask;
+    sigset_t writer_wait_mask;
+    sigset_t reader_wait_mask;
 
-    SharedData *data = mmap(NULL, sizeof(SharedData), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    sigemptyset(&block_mask);
+    sigaddset(&block_mask, SIGUSR1);
+    sigaddset(&block_mask, SIGUSR2);
 
-    if (data == MAP_FAILED) {
-        perror("mmap");
-        return 1;
-    }
+    sigprocmask(SIG_BLOCK, &block_mask, &old_mask);
 
-    data->write_pos = 0;
-    data->read_pos = 0;
+    writer_wait_mask = old_mask;
+    sigdelset(&writer_wait_mask, SIGUSR1);
+    sigdelset(&writer_wait_mask, SIGUSR2);
 
-    sem_init(&data->full, 1, N);
-    sem_init(&data->empty, 1, 0);
-    sem_init(&data->mutex, 1, 1);
+    reader_wait_mask = old_mask;
+    sigdelset(&reader_wait_mask, SIGUSR1);
+    sigaddset(&reader_wait_mask, SIGUSR2);
 
     pid_t pid = fork();
 
     if (pid == -1) {
-        perror("fork");
+        close(fd);
         return 1;
     }
 
     if (pid == 0) {
-        close(dst);
+        close(fd);
 
-        producer(src, data);
-
-        close(src);
-        return 0;
+        while (1) {
+            sigsuspend(&writer_wait_mask);
+        }
     }
 
-    close(src);
+    writer_pid = pid;
 
-    consumer(dst, data);
+    signal(SIGUSR1, ready_for_next_bit);
 
-    wait(NULL);
-
-    close(dst);
-
-    sem_destroy(&data->full);
-    sem_destroy(&data->empty);
-    sem_destroy(&data->mutex);
-
-    munmap(data, sizeof(SharedData));
-
-    return 0;
+    while (1) {
+        send_next_bit();
+        sigsuspend(&reader_wait_mask);
+    }
 }
