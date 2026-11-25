@@ -2,53 +2,134 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/wait.h>
-#include <sys/ipc.h>
-#include <sys/shm.h>
+#include <sys/resource.h>
+#include <time.h>
+#include <ctype.h>
 
-#define ITERATIONS 1000000
-
-int main(void)
+int main(int argc, char *argv[])
 {
-    int n = 0;
-
-    printf("Enter n: ");
-    scanf("%d", &n);
-
-    int shmid = shmget(IPC_PRIVATE, sizeof(long long), 0666 | IPC_CREAT);
-
-    if (shmid == -1) {
-        perror("shmget");
+    if (argc < 2) {
         return 1;
     }
 
-    void* memory = shmat(shmid, NULL, 0);
-    volatile long long *count = memory;
-    *count = 0;
+    int fd_out[2];
+    int fd_err[2];
 
-    for (int i = 0; i < n; ++i) {
-        pid_t pid = fork();
+    pipe(fd_out);
+    pipe(fd_err);
 
-        if (pid == -1) {
-            perror("fork");
-            return 1;
-        }
-        if (pid == 0) {
-            for (int j = 0; j < ITERATIONS; ++j)
-                (*count)++;
+    struct timespec t1, t2;
+    struct rusage usage;
 
-            shmdt((const void*)count);
-            return 0;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+
+    pid_t pid = fork();
+
+    if (pid == 0) {
+
+        close(fd_out[0]);
+        close(fd_err[0]);
+
+        dup2(fd_out[1], STDOUT_FILENO);
+        dup2(fd_err[1], STDERR_FILENO);
+
+        close(fd_out[1]);
+        close(fd_err[1]);
+
+        execvp(argv[1], &argv[1]);
+
+        perror("execvp");
+        exit(1);
+    }
+
+    close(fd_out[1]);
+    close(fd_err[1]);
+
+    char buffer[1024];
+
+    long bytes = 0;
+    long words = 0;
+    long lines = 0;
+
+    int inWordOut = 0;
+    int inWordErr = 0;
+
+    ssize_t bytesRead;
+
+    while ((bytesRead = read(fd_out[0], buffer, sizeof(buffer))) > 0) {
+
+        bytes += bytesRead;
+
+        for (ssize_t i = 0; i < bytesRead; i++) {
+
+            if (buffer[i] == '\n') {
+                lines++;
+            }
+
+            if (isspace((unsigned char)buffer[i])) {
+                inWordOut = 0;
+            } else if (!inWordOut) {
+                words++;
+                inWordOut = 1;
+            }
         }
     }
 
-    for (int i = 0; i < n; ++i)
-        wait(NULL);
+    close(fd_out[0]);
 
-    printf("Expected: %lld\n", (long long)n * ITERATIONS);
-    printf("Actual:   %lld\n", *count);
+    while ((bytesRead = read(fd_err[0], buffer, sizeof(buffer))) > 0) {
 
-    shmdt((const void *)count);
-    shmctl(shmid, IPC_RMID, NULL);
+        bytes += bytesRead;
+
+        for (ssize_t i = 0; i < bytesRead; i++) {
+
+            if (buffer[i] == '\n') {
+                lines++;
+            }
+
+            if (isspace((unsigned char)buffer[i])) {
+                inWordErr = 0;
+            } else if (!inWordErr) {
+                words++;
+                inWordErr = 1;
+            }
+        }
+    }
+
+    close(fd_err[0]);
+
+    wait4(pid, NULL, 0, &usage);
+    clock_gettime(CLOCK_MONOTONIC, &t2);
+
+    double realTime =
+        (t2.tv_sec - t1.tv_sec) +
+        (t2.tv_nsec - t1.tv_nsec) / 1000000000.0;
+
+    double userTime =
+        usage.ru_utime.tv_sec +
+        usage.ru_utime.tv_usec / 1000000.0;
+
+    double sysTime =
+        usage.ru_stime.tv_sec +
+        usage.ru_stime.tv_usec / 1000000.0;
+
+    printf("in stdout bytes: %ld\n", bytes);
+    printf("in stdout words: %ld\n", words);
+    printf("in stdout lines: %ld\n", lines);
+
+    printf("\nTime statistics:\n");
+    printf("real: %.3f s\n", realTime);
+    printf("user: %.3f s\n", userTime);
+    printf("sys:  %.3f s\n", sysTime);
+
+    fprintf(stderr, "in stderr bytes: %ld\n", bytes);
+    fprintf(stderr, "in stderr words: %ld\n", words);
+    fprintf(stderr, "in stderr lines: %ld\n", lines);
+
+    fprintf(stderr, "\nTime statistics:\n");
+    fprintf(stderr, "real: %.3f s\n", realTime);
+    fprintf(stderr, "user: %.3f s\n", userTime);
+    fprintf(stderr, "sys:  %.3f s\n", sysTime);
 
     return 0;
 }
